@@ -1,0 +1,447 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+
+% -----------------------------------------------------
+% bvraghav-tiet-ucs503p-article.sty
+% -----------------------------------------------------
+
+% Variable: Lab Instructor
+\makeatletter \newcommand{\BvrSetLabInstructor}[1]{%
+  \gdef\Bvr@LabInstructor{#1}}
+% default
+\newcommand{\Bvr@LabInstructor}{Dr. Raghav %
+  B. Venkataramaiyer}
+% public accessor
+\newcommand{\BvrLabInstructorValue}{\Bvr@LabInstructor}
+\makeatother
+
+% Add subtitle
+\usepackage{titling}
+% -- Set title bold
+\pretitle{\begin{center}\bfseries\fontsize{18bp}{18bp}\selectfont}
+\makeatletter
+\newcommand{\BvrSubtitle}[1]{%
+  \posttitle{%
+    \par\end{center}
+    \begin{center}\large#1\end{center}
+    \vskip 0.5em}%
+}
+\makeatother
+
+% Hints in the section title(s)
+\newcommand{\BvrHint}[1]{%
+  {\normalfont\normalsize\itshape\hfill #1}}
+
+% -----------------------------------------------------
+
+\title{API Gateway: A Self-Service Rate-Limiting Layer for Web APIs}
+
+\BvrSetLabInstructor{Dr. Paramveer Sidhu}
+
+\BvrSubtitle{%
+  Project Proposal for UCS503P  \\
+  Submitted to: \BvrLabInstructorValue \\ \bfseries \\[0.5em]
+  Thapar Institute of Engineering and Technology%
+}
+
+\author{
+  Sarthak Jagota - \texttt{1024030753} \\[0.3em]
+  Palak Mahajan - \texttt{1024030755} \\[0.3em]
+  Aayush Kumar Singh - \texttt{1024030758}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Higher-order goal%
+  \BvrHint{\ldots secondary framing}}
+This project aims to improve the \emph{resilience and cost-predictability of
+networked services} by making traffic control available to developers who
+cannot afford, or do not wish to operate, enterprise API-management
+infrastructure. While traffic shaping is a broad concern spanning cloud
+economics and denial-of-service resistance, the immediate engineering
+objective is narrower and concrete: to translate \emph{fair, enforceable
+request budgeting} into a deployable software layer that any API owner can
+place in front of an existing service without modifying that service.
+
+\section{Time-to-value %
+\BvrHint{\ldots primary heuristic}}
+\begin{itemize}[leftmargin=0.7cm]
+    \item The smallest useful product is a proxy that forwards a request and
+      returns HTTP~429 when a per-client budget is exhausted. This is
+      demonstrable in the first iteration and is independently valuable even
+      with no dashboard, no persistence and a single algorithm.
+    \item We will prioritise fast feedback over completeness by using weekly
+      iterations with CI-backed automation from the outset, so that each
+      increment is releasable to staging rather than accumulating on a branch.
+    \item The work splits into three parallel workstreams --- gateway and
+      rate-limiting logic, persistence and authentication, and the analytics
+      frontend --- allowing the team to produce measurable increments
+      concurrently rather than serially.
+    \item Success in iteration one is defined by measurement, not by feature
+      count: enforcement must be observably correct under concurrent load
+      before any feature is layered on top of it.
+\end{itemize}
+
+\section{Problem Statement}
+An HTTP API, by default, has no notion of a per-client budget. Every client is
+free to issue requests as fast as it can open connections, and the server
+discovers the consequences only after they occur. This produces four
+recurring failure modes:
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Resource exhaustion:} a single misbehaving client---whether
+      a retry loop caused by a bug, a scraper, or a deliberate abuser---can
+      saturate connection pools, database connections or worker threads, and
+      degrade service for every other client.
+    \item \textbf{Uncontrolled cost:} where the API is backed by metered
+      resources (managed databases, third-party APIs, egress bandwidth),
+      unbounded request volume translates directly into unbounded expenditure,
+      discovered only at billing time.
+    \item \textbf{No fairness guarantee:} without per-client accounting, a
+      well-behaved consumer and an abusive one are indistinguishable to the
+      server, so capacity is allocated by aggression rather than by policy.
+    \item \textbf{High cost of the remedy:} the standard solution---a
+      rate-limiting gateway between clients and the origin---exists in mature
+      form (Kong, Cloudflare, AWS API Gateway) but is either operationally
+      heavy or commercially priced. A developer wishing to protect a single
+      API must otherwise build the counting, storage and enforcement logic
+      themselves.
+\end{itemize}
+
+\textbf{Why this matters now (contextual relevance):} Deployment on shared
+platform-as-a-service tiers has made small APIs cheap to publish and
+correspondingly easy to overwhelm; the marginal cost of a request has moved
+from the developer's fixed server bill to a metered per-request charge. The
+absence of a lightweight, self-service traffic-control layer is therefore a
+present and practical gap rather than a hypothetical one.
+
+\section{Proposed Solution %
+\BvrHint{\ldots Software Proposition}}
+\subsection{Overview}
+We propose \textbf{API Gateway}, a web-based API protection layer that sits as a
+reverse proxy between a client and a target API. Its components are:
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Gateway/proxy layer:} intercepts every inbound request,
+      evaluates it against the applicable policy, forwards permitted requests
+      to the registered origin and rejects the remainder with HTTP~429
+      (\texttt{Too Many Requests}).
+    \item \textbf{Self-service registration portal:} an authenticated user
+      registers a target API URL, sets a request budget (requests per unit
+      time), and selects the enforcement algorithm.
+    \item \textbf{Distributed counting substrate:} per-client counters held in
+      Redis and manipulated through Bucket4j, so that the limit remains
+      correct when several gateway instances serve the same API.
+    \item \textbf{Analytics dashboard:} a React interface showing allowed
+      versus blocked volume, traffic over time, and a per-API breakdown.
+    \item \textbf{Request log:} a queryable table of recent requests with
+      outcome, timestamp and client identity, forming the evidential basis for
+      both the dashboard and our evaluation metrics.
+\end{itemize}
+
+\subsection{Core workflow}
+\begin{enumerate}[leftmargin=0.7cm]
+    \item A developer signs up, authenticates, and registers a target API,
+      receiving a gateway endpoint and an API key.
+    \item A client issues a request to that gateway endpoint bearing the key.
+    \item The gateway resolves the policy for (client, API), and performs an
+      atomic consume-or-reject operation against the Redis-backed counter.
+    \item If a token is available the request is proxied to the origin and the
+      origin's response is relayed verbatim; otherwise the gateway short-
+      circuits with HTTP~429 and the applicable \texttt{Retry-After} hint.
+    \item In both cases an outcome record is written to PostgreSQL.
+    \item The dashboard reads aggregated records over REST and renders them.
+\end{enumerate}
+
+\subsection{Operational constraints for a course-project setting}
+\begin{itemize}[leftmargin=0.7cm]
+    \item The gateway must add only bounded latency to the proxied path; a
+      correct limiter that doubles response time is not a usable one.
+    \item We avoid dependence on novel research: token bucket and sliding
+      window are well-specified, published algorithms, and our contribution is
+      their correct distributed implementation and instrumentation, not their
+      invention.
+    \item The whole system must deploy on free or low-cost managed tiers
+      (application host, managed Redis, managed PostgreSQL) so that the pilot
+      is reproducible by the evaluator without provisioning cost.
+    \item The dashboard must remain usable on low-to-mid range devices through
+      responsive design and server-side aggregation rather than shipping raw
+      logs to the browser.
+\end{itemize}
+
+\section{Solution Approach %
+\BvrHint{\ldots Engineering focus}}
+This is an engineering course project. Accordingly the emphasis falls on
+correctness under concurrency, clean separation of concerns, and measurable
+behaviour, rather than on algorithmic novelty.
+
+\subsection{Rate-limiting strategy %
+\BvrHint{\ldots non-research}}
+Enforcement uses two standard algorithms, both provided by Bucket4j over a
+Redis backend:
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Token bucket:} a bucket of capacity $C$ refilled at rate $r$;
+      each request consumes one token, and a request arriving at an empty
+      bucket is rejected. This permits controlled bursts up to $C$ while
+      bounding the long-run average at $r$.
+    \item \textbf{Sliding window:} the count of requests within a moving
+      interval of width $W$ is compared against a threshold $N$, giving
+      smoother enforcement at the cost of more state per client.
+    \item \textbf{Correctness under distribution:} counter updates are
+      performed as atomic server-side operations in Redis, so that two gateway
+      instances handling simultaneous requests from the same client cannot
+      both observe the same available token. This---not the arithmetic of
+      either algorithm---is the substantive engineering problem.
+    \item \textbf{Failure policy:} the behaviour when the counter store is
+      unreachable is an explicit design decision (fail-open, preserving
+      availability, versus fail-closed, preserving protection). We will
+      implement one, document the rationale, and test it.
+\end{itemize}
+
+\subsection{Web architecture %
+\BvrHint{\ldots web-based solution}}
+A three-tier architecture with an additional in-memory tier for counters:
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Frontend:} React single-page application with Recharts for
+      visualisation; communicates with the backend exclusively over REST.
+    \item \textbf{Gateway/Backend:} Spring Boot with Spring Cloud Gateway for
+      the proxy path; Spring Security with JWT for authentication; Spring Data
+      JPA for persistence.
+    \item \textbf{Counter store:} Redis, holding only ephemeral per-client
+      counter state.
+    \item \textbf{Database:} PostgreSQL, holding users, registered APIs,
+      policies and request logs.
+\end{itemize}
+
+\noindent The request path is summarised below.
+
+\begin{center}
+\begin{minipage}{0.92\textwidth}
+\ttfamily\small
+Client\\
+\quad$\downarrow$\\
+API Gateway (Spring Cloud Gateway)\\
+\quad$\downarrow$\ \ consume-or-reject\\
+Bucket4j + Redis (distributed counter)\\
+\quad$\downarrow$\ \ if allowed\\
+Target API \ $\longrightarrow$ \ response relayed to client\\
+\quad$\downarrow$\ \ always\\
+Request log written \ $\longrightarrow$ \ PostgreSQL (Spring Data JPA)\\
+\quad$\downarrow$\\
+React Dashboard (REST) \ $\longrightarrow$ \ charts and logs
+\end{minipage}
+\end{center}
+
+\subsection{Technology selection}
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.34\textwidth}>{\raggedright\arraybackslash}p{0.56\textwidth}@{}}
+\toprule
+\textbf{Layer} & \textbf{Technology} \\
+\midrule
+Gateway / Backend        & Spring Boot, Spring Cloud Gateway \\
+Rate limiting            & Bucket4j \\
+Counter store            & Redis \\
+Primary database         & PostgreSQL (Spring Data JPA) \\
+Authentication           & Spring Security + JWT \\
+Frontend                 & React + Recharts \\
+API testing              & Postman; JUnit for automated tests \\
+Deployment               & Render/Railway (backend, Redis, PostgreSQL); Vercel (frontend) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{CI/CD and fast delivery enabler}
+CI/CD will be used to:
+\begin{itemize}[leftmargin=0.7cm]
+    \item build the backend and run unit and integration tests on every change;
+    \item run the load-and-enforcement test suite, so that a regression in
+      limiting accuracy fails the build rather than reaching staging;
+    \item produce repeatable deployment artifacts (container images) for
+      staging;
+    \item enable safe and frequent release of incremental features.
+\end{itemize}
+
+\section{Evaluation Criterion %
+\BvrHint{\ldots measurable and attributable}}
+Success is defined by instrumented measurement on the deployed system, not by
+feature presence.
+
+\subsection{Primary evaluation metric}
+\textbf{Enforcement accuracy under concurrent load (EA):} for a configured
+limit of $N$ requests per window, the number of requests actually admitted to
+the origin when $M \gg N$ concurrent requests are issued from a single client
+identity across all running gateway instances.
+\begin{itemize}[leftmargin=0.7cm]
+    \item Target: admitted count within $\pm 2\%$ of $N$, with two gateway
+      instances active, over a driver issuing at least $10N$ requests.
+    \item Attribution: computed by comparing the load driver's own tally of
+      HTTP~200 versus HTTP~429 responses against the count of forwarded
+      requests recorded at the origin. Over-admission indicates a race in the
+      counter path; under-admission indicates an over-strict window boundary.
+      Both are attributable to the limiter, not to the network.
+\end{itemize}
+
+\subsection{Secondary evaluation metrics}
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Added latency (p50/p95):} difference in response time between
+      a request routed through the API Gateway and the same request issued directly
+      to the origin. Target: p95 overhead $\le$ 50\,ms on the pilot deployment.
+    \item \textbf{Sustained throughput:} requests per second the gateway
+      sustains before p95 latency degrades beyond the above threshold,
+      reported per instance count to evidence horizontal scaling.
+    \item \textbf{Log completeness:} proportion of driver-issued requests
+      appearing in the PostgreSQL log with the correct outcome. Target:
+      $\ge$ 99.9\%, since the dashboard's credibility rests on this.
+    \item \textbf{Dashboard freshness:} lag between a request occurring and its
+      appearance in dashboard aggregates.
+    \item \textbf{Reliability:} availability of the staging gateway for proxy
+      and login operations during the pilot window (target $\ge$ 99\% uptime).
+\end{itemize}
+
+\subsection{Pilot validation plan %
+\BvrHint{\ldots high-level}}
+\begin{itemize}[leftmargin=0.7cm]
+    \item Register a small set of representative target APIs (a deliberately
+      slow endpoint, a fast endpoint, and a public third-party API) to
+      exercise differing latency profiles.
+    \item Drive load using a scripted client at controlled concurrency levels,
+      repeating each run with one and with two gateway instances to
+      demonstrate that distributed counting holds.
+    \item Recruit 5--10 developer users to register their own API and report
+      clarity of setup and of the dashboard on a 1--5 scale, providing a
+      usability counterweight to the purely quantitative metrics.
+\end{itemize}
+
+\section{Scalability %
+\BvrHint{\ldots with foresight}}
+The proposition should scale in both theoretical and practical senses.
+
+\begin{enumerate}[leftmargin=0.7cm]
+    \item \textbf{Scalable (theoretically):} the design admits growth in
+      request volume, registered APIs and concurrent dashboard users by:
+    \begin{itemize}[leftmargin=0.7cm]
+        \item keeping the gateway \emph{stateless}, with all mutable limiting
+          state externalised to Redis, so instances may be added or removed
+          freely behind a load balancer;
+        \item performing counter updates as single atomic operations, so
+          coordination cost does not grow with instance count;
+        \item writing request logs asynchronously off the request path, so
+          that persistence latency does not enter the client's critical path;
+        \item indexing log queries on (\texttt{api\_id}, \texttt{timestamp})
+          and serving the dashboard from pre-aggregated summaries with
+          pagination rather than raw scans.
+    \end{itemize}
+
+    \item \textbf{Operationally deployable (practically):} the system runs on
+      commodity managed infrastructure:
+    \begin{itemize}[leftmargin=0.7cm]
+        \item managed Redis and managed PostgreSQL instances;
+        \item containerised deployment of the gateway, permitting horizontal
+          replication;
+        \item static hosting of the React frontend on a CDN-backed platform;
+        \item a CI/CD pipeline targeting staging and then production.
+    \end{itemize}
+\end{enumerate}
+
+\section{Engine availability heuristic}
+A mature set of ``engines'' exists for every layer of this proposition, which
+is what makes the scope realistic within a course timeline:
+\begin{itemize}[leftmargin=0.7cm]
+    \item Spring Boot and Spring Cloud Gateway for the reverse-proxy and REST
+      layers.
+    \item Bucket4j as a maintained implementation of the token-bucket and
+      window algorithms, with an existing Redis integration.
+    \item Redis for atomic, low-latency counter operations.
+    \item PostgreSQL with Spring Data JPA for durable relational storage.
+    \item Spring Security with JWT for token-based authentication.
+    \item React with Recharts for the dashboard and its visualisations.
+    \item JUnit and Testcontainers for integration tests against real Redis and
+      PostgreSQL instances.
+    \item A CI runner (GitHub Actions) and free-tier staging targets.
+\end{itemize}
+We use these mature components deliberately, so that our engineering effort is
+spent on correct distributed enforcement, instrumentation and measurement,
+rather than on reimplementing infrastructure.
+
+\section{Project scope and deliverables %
+\BvrHint{\ldots iteration-friendly}}
+\subsection{Initial deliverable %
+\BvrHint{\ldots first iteration}}
+\begin{itemize}[leftmargin=0.7cm]
+    \item Working reverse proxy: request forwarded to a configured target API
+      and response relayed.
+    \item Token-bucket enforcement backed by Redis, returning HTTP~429 with
+      \texttt{Retry-After} on rejection.
+    \item User signup and login with JWT; API registration with a configurable
+      limit.
+    \item Request logging to PostgreSQL with timestamps and outcome, sufficient
+      to compute the primary metric.
+    \item CI: build, backend unit tests, and linting on every push.
+    \item CD to staging as a single pipeline job.
+\end{itemize}
+
+\subsection{Subsequent deliverables}
+\begin{itemize}[leftmargin=0.7cm]
+    \item Sliding-window algorithm as a selectable policy per API.
+    \item React analytics dashboard: allowed versus blocked counts, traffic
+      over time, per-API breakdown.
+    \item Request log view with filtering and pagination.
+    \item Multi-instance validation run demonstrating enforcement accuracy
+      across two gateways.
+    \item \emph{(Stretch)} Request replay: re-issue a specific blocked or
+      failed request from the log.
+    \item \emph{(Stretch)} Live side-by-side comparison of the two algorithms
+      under identical load.
+\end{itemize}
+
+\section{Risks and mitigations}
+\begin{itemize}[leftmargin=0.7cm]
+    \item \textbf{Counter store as a single point of failure:} Redis
+      unavailability would disable enforcement. \emph{Mitigation:} define and
+      implement an explicit fail-open/fail-closed policy, surface the degraded
+      state in the dashboard, and test the failure path in CI.
+    \item \textbf{Latency budget:} an additional network hop plus a counter
+      lookup could exceed the acceptable overhead. \emph{Mitigation:}
+      co-locate gateway and Redis in the same region, keep logging off the
+      request path, and treat p95 overhead as a build-gating metric.
+    \item \textbf{Race conditions in distributed counting:} the defining
+      correctness risk of the project. \emph{Mitigation:} rely on atomic
+      server-side operations rather than read-modify-write, and make
+      multi-instance concurrent load tests part of the automated suite from
+      iteration one.
+    \item \textbf{Credential and secret handling:} JWT signing keys and
+      registered-API credentials are sensitive. \emph{Mitigation:} store
+      secrets in platform-managed environment configuration, never in the
+      repository; store only what is needed and hash user credentials.
+    \item \textbf{Proxy abuse:} an open proxy can be misused to reach arbitrary
+      hosts. \emph{Mitigation:} permit forwarding only to targets registered by
+      an authenticated owner, and validate target URLs on registration.
+    \item \textbf{Scope creep from stretch features:} replay and live
+      comparison are attractive but non-essential. \emph{Mitigation:} they are
+      explicitly scheduled last and gated on the primary metric being met.
+    \item \textbf{Free-tier deployment limits:} cold starts and connection
+      caps on free tiers can distort latency measurements.
+      \emph{Mitigation:} warm the service before measurement runs and report
+      the deployment tier alongside every figure.
+\end{itemize}
+
+\section{Summary}
+This project proposes API Gateway, a deployable, self-service rate-limiting
+gateway that lets a developer place enforceable traffic control in front of an
+existing API without modifying it. It meets the course criteria by
+emphasising time-to-value---a useful proxy-plus-limiter is releasable in the
+first iteration---by using CI/CD to support frequent safe releases, and by
+defining evaluation in measurable, attributable terms, principally enforcement
+accuracy under concurrent load with added latency as a bounding constraint.
+It relies throughout on mature components and published algorithms, keeping
+the engineering contribution in correct distributed implementation,
+instrumentation and scalability readiness rather than in research novelty.
+
+\end{document}
